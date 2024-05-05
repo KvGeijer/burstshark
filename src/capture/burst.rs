@@ -134,6 +134,9 @@ fn create_bursts<K: Clone + Eq + std::hash::Hash, F: Flow>(
             // TODO: Can we just use eq?
             // The flow has not been modified since the time was inserted into the queue
             // So it can be made a burst
+
+            // TODO: Should we remove the flow from the hashmap to save space?
+            // Otherwise it will continue to grow forever
             flow.send_burst(&output_tx, current_time)
                 .expect("Could not send a burst!");
         }
@@ -233,59 +236,57 @@ impl WlanFlow {
         }
     }
 
-    fn add_packet(&mut self, _p: &WlanPacket) {
-        // Also, don't understand the if statement...
-        todo!("Fixed it for IP, but Wlan might present some new difficulties with the out-of-order...");
-        // if p.time - self.current_burst.end > inactive_time {
-        //     self.current_burst.completion_time = p.time;
-        //     tx.send(self.current_burst.clone()).unwrap();
-        //     self.current_burst = Burst::from_wlan_packet(p);
+    fn add_packet(&mut self, p: &WlanPacket) {
+        if let Some(ref mut current_burst) = &mut self.current_burst {
+            // Packet sequence number is what we expect.
+            if p.seq_number == self.expected_seq_number {
+                self.expected_seq_number = (p.seq_number + 1) & 4095;
+                self.last_packet_len = p.data_len;
+                current_burst.end = p.time;
+                current_burst.num_packets += 1;
+                current_burst.size += p.data_len;
+                return;
+            }
 
-        //     // Accept sequence number of packet after the inactive time.
-        //     self.expected_seq_number = (p.seq_number + 1) & 4095;
-        //     // Packet sequence number is what we expect.
-        //     if p.seq_number == self.expected_seq_number {
-        //         self.expected_seq_number = (p.seq_number + 1) & 4095;
-        //         self.last_packet_len = p.data_len;
-        //         self.current_burst.end = p.time;
-        //         self.current_burst.num_packets += 1;
-        //         self.current_burst.size += p.data_len;
-        //         return;
-        //     }
+            // Packet sequence number not what we expect.
+            let diff = (p.seq_number as i16 - self.expected_seq_number as i16) & 4095;
+            let signed_diff = if diff <= 2048 { diff } else { diff - 4096 };
 
-        //     // Packet sequence number not what we expect.
-        //     let diff = (p.seq_number as i16 - self.expected_seq_number as i16) & 4095;
-        //     let signed_diff = if diff <= 2048 { diff } else { diff - 4096 };
+            // We already added this packet, but it is probably being retransmitted.
+            // Note: not enough to filter on the retransmission bit as the first frame might be lost.
+            if -(self.max_deviation as i16) < signed_diff && signed_diff < 0 {
+                current_burst.end = p.time;
+                return;
+            }
 
-        //     // We already added this packet, but it is probably being retransmitted.
-        //     // Note: not enough to filter on the retransmission bit as the first frame might be lost.
-        //     if -(self.max_deviation as i16) < signed_diff && signed_diff < 0 {
-        //         self.current_burst.end = p.time;
-        //         return;
-        //     }
+            // The packet has a sequence number that is further along than what we expect.
+            // Monitor mode device might have missed frames.
+            if 0 < signed_diff && signed_diff < self.max_deviation as i16 {
+                if !self.no_guess {
+                    // Guess the lengths of the lost frames
+                    let guess = (self.last_packet_len + p.data_len) / 2;
+                    current_burst.num_packets += diff as u16;
+                    current_burst.size += guess * diff as u32;
+                } else {
+                    // Accept only this
+                    current_burst.num_packets += 1;
+                    current_burst.size += p.data_len;
+                }
+                // Bring the expected sequence number in line with the packet.
+                self.expected_seq_number = (p.seq_number + 1) & 4095;
+                self.last_packet_len = p.data_len;
+                current_burst.end = p.time;
+            } else {
+                // In case of a larger deviation, might be a single outlier, go to next expected.
+                self.expected_seq_number = (self.expected_seq_number + 1) & 4095;
+            }
+        } else {
+            self.current_burst = Some(Burst::from_wlan_packet(p));
 
-        //     // The packet has a sequence number that is further along than what we expect.
-        //     // Monitor mode device might have missed frames.
-        //     if 0 < signed_diff && signed_diff < self.max_deviation as i16 {
-        //         if !self.no_guess {
-        //             // Guess the lengths of the lost frames
-        //             let guess = (self.last_packet_len + p.data_len) / 2;
-        //             self.current_burst.num_packets += diff as u16;
-        //             self.current_burst.size += guess * diff as u32;
-        //         } else {
-        //             // Accept only this
-        //             self.current_burst.num_packets += 1;
-        //             self.current_burst.size += p.data_len;
-        //         }
-        //         // Bring the expected sequence number in line with the packet.
-        //         self.expected_seq_number = (p.seq_number + 1) & 4095;
-        //         self.last_packet_len = p.data_len;
-        //         self.current_burst.end = p.time;
-        //     } else {
-        //         // In case of a larger deviation, might be a single outlier, go to next expected.
-        //         self.expected_seq_number = (self.expected_seq_number + 1) & 4095;
-        //     }
-        // }
+            // Accept sequence number of packet after the inactive time.
+            self.expected_seq_number = (p.seq_number + 1) & 4095;
+            self.last_packet_len = p.data_len;
+        };
     }
 }
 
